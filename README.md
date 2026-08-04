@@ -1,5 +1,6 @@
 # Linux Misc Character Device Lab
 
+![Build](https://github.com/jne21/linux-misc-device-lab/actions/workflows/build.yml/badge.svg)
 ![Language](https://img.shields.io/badge/language-C-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 ![Kernel Module](https://img.shields.io/badge/type-kernel%20module-orange)
@@ -337,14 +338,15 @@ When a file descriptor is closed, its statistics are written to the kernel log.
 .
 ├── jne_demo.c
 ├── jne_demo_ioctl.h
-├── nonblock_read.c
-├── nonblock_write.c
-├── poll_read.c
-├── ioctl_test.c
-├── file_state_test.c
 ├── Makefile
-├── .gitignore
 ├── README.md
+├── test.sh
+├── tests/
+│   ├── nonblock_read.c
+│   ├── nonblock_write.c
+│   ├── poll_read.c
+│   ├── ioctl_test.c
+│   └── file_state_test.c
 └── bin/
     ├── jne_demo.ko
     ├── nonblock_read
@@ -954,6 +956,46 @@ After testing:
 make unload
 ```
 
+## Automated Tests
+
+The repository includes an integration test script that verifies the main driver features:
+
+* module build and loading;
+* device creation;
+* non-blocking reads;
+* FIFO message order;
+* `poll()` notifications;
+* `ioctl()` commands;
+* per-open statistics;
+* non-blocking writes to a full queue;
+* module unloading and device removal.
+
+Run the complete test suite with:
+
+```bash
+make test
+```
+
+The test target builds the kernel module and all user-space test programs before running `test.sh`.
+
+Expected result:
+
+```text
+PASS: Module loading and device creation
+PASS: Non-blocking read from empty queue
+PASS: FIFO message order
+PASS: poll() notification
+PASS: ioctl commands
+PASS: Per-open statistics
+PASS: Non-blocking write to full queue
+PASS: Module unloading and device removal
+
+All integration tests passed.
+```
+
+The test script automatically unloads the module and removes temporary files when it finishes or fails.
+
+
 ## Safety
 
 > [!WARNING]
@@ -988,8 +1030,8 @@ Recommended precautions:
 * [x] Periodic delayed work
 * [x] Safe delayed-work cancellation
 * [x] Separate `bin/` build output
-* [ ] Automated integration tests
-* [ ] CI build verification
+* [x] Automated integration tests
+* [x] CI build verification
 * [ ] Device Tree and platform-driver example
 
 ## Learning Path

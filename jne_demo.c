@@ -9,12 +9,14 @@
 #include <linux/kfifo.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <linux/jiffies.h>
 
 #include "jne_demo_ioctl.h"
 
 #define DEVICE_NAME "jne_demo"
 #define BUFFER_SIZE 256
 #define QUEUE_CAPACITY 16
+#define STATUS_INTERVAL_MS 5000
 
 //--------------------------------------------------------------------------------
 
@@ -44,6 +46,9 @@ static atomic_t message_count = ATOMIC_INIT(0);
 
 static DECLARE_WAIT_QUEUE_HEAD(read_wait_queue);
 static DECLARE_WAIT_QUEUE_HEAD(write_wait_queue);
+
+static struct delayed_work status_work;
+static bool module_stopping;
 
 //--------------------------------------------------------------------------------
 
@@ -365,9 +370,34 @@ static struct miscdevice jne_demo_device = {
 
 //--------------------------------------------------------------------------------
 
+static void jne_demo_status_work(struct work_struct *work)
+{
+    int count;
+
+    (void)work;
+
+    count = atomic_read(&message_count);
+
+    pr_info(
+        "jne_demo: queue status: %d/%d messages, %d slots available\n",
+        count,
+        QUEUE_CAPACITY,
+        QUEUE_CAPACITY - count);
+
+    if (!READ_ONCE(module_stopping))
+        queue_delayed_work(
+            message_work_queue,
+            &status_work,
+            msecs_to_jiffies(STATUS_INTERVAL_MS));
+}
+
+//--------------------------------------------------------------------------------
+
 static int __init jne_demo_init(void)
 {
     int result;
+
+    WRITE_ONCE(module_stopping, false);
 
     kfifo_reset(&message_queue);
     atomic_set(&message_count, 0);
@@ -375,6 +405,8 @@ static int __init jne_demo_init(void)
     message_work_queue = alloc_ordered_workqueue("jne_demo_wq", 0);
     if (!message_work_queue)
         return -ENOMEM;
+
+    INIT_DELAYED_WORK(&status_work, jne_demo_status_work);
 
     result = misc_register(&jne_demo_device);
     if (result) {
@@ -385,6 +417,11 @@ static int __init jne_demo_init(void)
         return result;
     }
 
+    queue_delayed_work(
+        message_work_queue,
+        &status_work,
+        msecs_to_jiffies(STATUS_INTERVAL_MS));
+
     pr_info("jne_demo: module loaded\n");
     return 0;
 }
@@ -394,6 +431,9 @@ static int __init jne_demo_init(void)
 static void __exit jne_demo_exit(void)
 {
     misc_deregister(&jne_demo_device);
+
+    WRITE_ONCE(module_stopping, true);
+    cancel_delayed_work_sync(&status_work);
 
     destroy_workqueue(message_work_queue);
     message_work_queue = NULL;

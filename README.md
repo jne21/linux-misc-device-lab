@@ -35,6 +35,8 @@ The project demonstrates communication between user space and kernel space throu
 | Readiness notification    | `poll()`, `select()`, `epoll()`           |
 | Control commands          | `ioctl()`                                 |
 | Per-open statistics       | `file->private_data`                      |
+| Debug diagnostics         | `debugfs` status, messages and statistics |
+| Global statistics         | 64-bit atomic counters                    |
 | Asynchronous processing   | Ordered kernel workqueue                  |
 | Periodic status reporting | Configurable `delayed_work` interval      |
 | Runtime configuration     | Writable module parameter through `sysfs` |
@@ -470,6 +472,135 @@ Example output:
 parm:           status_reporting:Enable periodic queue status reporting (bool)
 parm:           status_interval_ms:Queue status reporting interval in milliseconds, minimum 100 (uint)
 ```
+
+## DebugFS Diagnostics
+
+The module exposes diagnostic information through `debugfs`.
+
+The files are created under:
+
+```text
+/sys/kernel/debug/jne_demo
+```
+
+Available files:
+
+| File       | Description                                     |
+| ---------- | ----------------------------------------------- |
+| `status`   | Current queue state and reporting configuration |
+| `messages` | Current FIFO contents without removing messages |
+| `stats`    | Global driver operation counters                |
+
+`debugfs` is intended for diagnostics and debugging. It is not a stable user-space ABI.
+
+### Status
+
+Read the current queue state:
+
+```bash
+sudo cat /sys/kernel/debug/jne_demo/status
+```
+
+Example output:
+
+```text
+messages: 3
+capacity: 16
+available: 13
+status_reporting: enabled
+status_interval_ms: 1000
+```
+
+The values represent a momentary snapshot of the driver state.
+
+### Queue Contents
+
+Inspect all queued messages without removing them:
+
+```bash
+sudo cat /sys/kernel/debug/jne_demo/messages
+```
+
+Example output:
+
+```text
+messages: 3
+[0] length=13 data="First message"
+[1] length=14 data="Second message"
+[2] length=13 data="Third message"
+```
+
+The FIFO is copied while holding the queue mutex. The diagnostic output is generated after the mutex has been released.
+
+Reading this file does not modify the queue. The same messages remain available through `/dev/jne_demo`.
+
+### Global Statistics
+
+Read global driver statistics:
+
+```bash
+sudo cat /sys/kernel/debug/jne_demo/stats
+```
+
+Example output:
+
+```text
+opens: 4
+closes: 4
+messages_read: 3
+messages_written: 3
+bytes_read: 40
+bytes_written: 40
+async_jobs: 3
+```
+
+The counters are stored as 64-bit atomic values:
+
+```c
+struct jne_demo_global_stats {
+    atomic64_t opens;
+    atomic64_t closes;
+    atomic64_t messages_read;
+    atomic64_t messages_written;
+    atomic64_t bytes_read;
+    atomic64_t bytes_written;
+    atomic64_t async_jobs;
+};
+```
+
+Unlike the per-open statistics stored in `file->private_data`, these counters belong to the entire loaded module.
+
+The `async_jobs` counter represents asynchronous work items that have completed execution.
+
+### Mounting DebugFS
+
+Check whether `debugfs` is mounted:
+
+```bash
+mount | grep debugfs
+```
+
+If required, mount it manually:
+
+```bash
+sudo mount -t debugfs none /sys/kernel/debug
+```
+
+### Cleanup
+
+The module removes the entire diagnostic directory during unloading:
+
+```c
+debugfs_remove_recursive(debugfs_directory);
+debugfs_directory = NULL;
+```
+
+After unloading the module, this path must no longer exist:
+
+```text
+/sys/kernel/debug/jne_demo
+```
+
 
 ## Per-Open State
 
@@ -1268,6 +1399,9 @@ Recommended precautions:
 * [x] Automated integration tests
 * [x] CI build verification
 * [x] `debugfs` diagnostics
+* [x] `debugfs` status interface
+* [x] `debugfs` queue inspection
+* [x] `debugfs` global statistics
 * [ ] Device Tree and platform-driver example
 
 ## Development Path
@@ -1312,6 +1446,10 @@ runtime configuration through sysfs
 automated integration testing
     ↓
 continuous integration build verification
+    ↓
+debugfs diagnostics
+    ↓
+global atomic statistics
 ```
 
 ## License

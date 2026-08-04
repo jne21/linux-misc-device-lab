@@ -44,6 +44,14 @@ pass()
 echo "PASS: $1"
 }
 
+get_stat()
+{
+    local name="$1"
+    local content="$2"
+
+    awk -F ': ' -v name="$name" '$1 == name { print $2 }' <<< "$content"
+}
+
 trap cleanup EXIT
 
 cd "$ROOT_DIR"
@@ -79,6 +87,9 @@ sudo test -f "$DEBUGFS_DIR/status" ||
 
 sudo test -f "$DEBUGFS_DIR/messages" ||
     fail "debugfs messages file was not created"
+
+sudo test -f "$DEBUGFS_DIR/stats" ||
+    fail "debugfs stats file was not created"
 
 status_output="$(sudo cat "$DEBUGFS_DIR/status")"
 
@@ -127,6 +138,79 @@ actual_message="$(timeout 2 cat "$DEVICE_PATH")"
 fail "debugfs messages read modified the queued message"
 
 pass "debugfs queue inspection"
+
+stats_before="$(sudo cat "$DEBUGFS_DIR/stats")"
+
+opens_before="$(get_stat opens "$stats_before")"
+closes_before="$(get_stat closes "$stats_before")"
+messages_read_before="$(get_stat messages_read "$stats_before")"
+messages_written_before="$(get_stat messages_written "$stats_before")"
+bytes_read_before="$(get_stat bytes_read "$stats_before")"
+bytes_written_before="$(get_stat bytes_written "$stats_before")"
+async_jobs_before="$(get_stat async_jobs "$stats_before")"
+
+for value in \
+    "$opens_before" \
+    "$closes_before" \
+    "$messages_read_before" \
+    "$messages_written_before" \
+    "$bytes_read_before" \
+    "$bytes_written_before" \
+    "$async_jobs_before"; do
+    [[ "$value" =~ ^[0-9]+$ ]] ||
+        fail "debugfs stats contains an invalid counter"
+done
+
+printf 'Stats message' > "$DEVICE_PATH"
+
+stats_message="$(timeout 2 cat "$DEVICE_PATH")"
+
+[[ "$stats_message" == "Stats message" ]] ||
+    fail "Statistics test did not read the expected message"
+
+async_jobs_expected=$((async_jobs_before + 1))
+
+for _ in $(seq 1 20); do
+    stats_after="$(sudo cat "$DEBUGFS_DIR/stats")"
+    async_jobs_after="$(get_stat async_jobs "$stats_after")"
+
+    if [[ "$async_jobs_after" == "$async_jobs_expected" ]]; then
+        break
+    fi
+
+    sleep 0.05
+done
+
+opens_after="$(get_stat opens "$stats_after")"
+closes_after="$(get_stat closes "$stats_after")"
+messages_read_after="$(get_stat messages_read "$stats_after")"
+messages_written_after="$(get_stat messages_written "$stats_after")"
+bytes_read_after="$(get_stat bytes_read "$stats_after")"
+bytes_written_after="$(get_stat bytes_written "$stats_after")"
+async_jobs_after="$(get_stat async_jobs "$stats_after")"
+
+[[ "$opens_after" -eq $((opens_before + 2)) ]] ||
+    fail "Global open counter is incorrect"
+
+[[ "$closes_after" -eq $((closes_before + 2)) ]] ||
+    fail "Global close counter is incorrect"
+
+[[ "$messages_read_after" -eq $((messages_read_before + 1)) ]] ||
+    fail "Global messages-read counter is incorrect"
+
+[[ "$messages_written_after" -eq $((messages_written_before + 1)) ]] ||
+    fail "Global messages-written counter is incorrect"
+
+[[ "$bytes_read_after" -eq $((bytes_read_before + 13)) ]] ||
+    fail "Global bytes-read counter is incorrect"
+
+[[ "$bytes_written_after" -eq $((bytes_written_before + 13)) ]] ||
+    fail "Global bytes-written counter is incorrect"
+
+[[ "$async_jobs_after" -eq "$async_jobs_expected" ]] ||
+    fail "Global asynchronous-job counter is incorrect"
+
+pass "debugfs global statistics"
 
 echo 1000 | sudo tee "$STATUS_INTERVAL_PATH" >/dev/null
 

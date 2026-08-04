@@ -29,6 +29,8 @@ static int jne_demo_debugfs_status_show(struct seq_file *file, void *data);
 static int jne_demo_debugfs_status_open(struct inode *inode, struct file *file);
 static int jne_demo_debugfs_messages_show(struct seq_file *file, void *data);
 static int jne_demo_debugfs_messages_open(struct inode *inode, struct file *file);
+static int jne_demo_debugfs_stats_show(struct seq_file *file, void *data);
+static int jne_demo_debugfs_stats_open(struct inode *inode, struct file *file);
 
 static const struct kernel_param_ops status_interval_ops = {
     .set = jne_demo_set_status_interval,
@@ -76,6 +78,24 @@ static const struct file_operations jne_demo_debugfs_messages_fops = {
     .release = single_release,
 };
 
+static const struct file_operations jne_demo_debugfs_stats_fops = {
+    .owner = THIS_MODULE,
+    .open = jne_demo_debugfs_stats_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+struct jne_demo_global_stats {
+    atomic64_t opens;
+    atomic64_t closes;
+    atomic64_t messages_read;
+    atomic64_t messages_written;
+    atomic64_t bytes_read;
+    atomic64_t bytes_written;
+    atomic64_t async_jobs;
+};
+
 static struct workqueue_struct *message_work_queue;
 
 static DEFINE_KFIFO(message_queue, struct jne_demo_message, QUEUE_CAPACITY);
@@ -87,6 +107,7 @@ static DECLARE_WAIT_QUEUE_HEAD(write_wait_queue);
 
 static struct delayed_work status_work;
 static struct dentry *debugfs_directory;
+static struct jne_demo_global_stats global_stats;
 
 static bool module_stopping;
 
@@ -134,6 +155,9 @@ wait_for_message:
         goto unlock;
     }
 
+    atomic64_inc(&global_stats.messages_read);
+    atomic64_add(message.length, &global_stats.bytes_read);
+
     kfifo_skip(&message_queue);
     atomic_dec(&message_count);
 
@@ -175,6 +199,7 @@ static void jne_demo_process_message(struct work_struct *work)
         message_work->message.length,
         checksum);
 
+    atomic64_inc(&global_stats.async_jobs);
     kfree(message_work);
 }
 
@@ -237,6 +262,9 @@ wait_for_space:
     }
 
     atomic_inc(&message_count);
+    atomic64_inc(&global_stats.messages_written);
+    atomic64_add(bytes_to_copy, &global_stats.bytes_written);
+
     result = bytes_to_copy;
 
     if (state) {
@@ -436,6 +464,27 @@ static int jne_demo_debugfs_messages_open(struct inode *inode, struct file *file
 }
 
 //--------------------------------------------------------------------------------
+
+static int jne_demo_debugfs_stats_show(struct seq_file *file, void *data)
+{
+    (void)data;
+
+    seq_printf(file, "opens: %lld\n", atomic64_read(&global_stats.opens));
+    seq_printf(file, "closes: %lld\n", atomic64_read(&global_stats.closes));
+    seq_printf(file, "messages_read: %lld\n", atomic64_read(&global_stats.messages_read));
+    seq_printf(file, "messages_written: %lld\n", atomic64_read(&global_stats.messages_written));
+    seq_printf(file, "bytes_read: %lld\n", atomic64_read(&global_stats.bytes_read));
+    seq_printf(file, "bytes_written: %lld\n", atomic64_read(&global_stats.bytes_written));
+    seq_printf(file, "async_jobs: %lld\n", atomic64_read(&global_stats.async_jobs));
+
+    return 0;
+}
+
+static int jne_demo_debugfs_stats_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, jne_demo_debugfs_stats_show, inode->i_private);
+}
+
 //--------------------------------------------------------------------------------
 //--------------------------------------------------------------------------------
 //--------------------------------------------------------------------------------
@@ -450,6 +499,8 @@ static int jne_demo_open(struct inode *inode, struct file *file)
         return -ENOMEM;
 
     file->private_data = state;
+
+    atomic64_inc(&global_stats.opens);
 
     pr_info("jne_demo: device opened\n");
     return 0;
@@ -472,6 +523,8 @@ static int jne_demo_release(struct inode *inode, struct file *file)
         kfree(state);
         file->private_data = NULL;
     }
+
+    atomic64_inc(&global_stats.closes);
 
     return 0;
 }
@@ -531,6 +584,14 @@ static int __init jne_demo_init(void)
     kfifo_reset(&message_queue);
     atomic_set(&message_count, 0);
 
+    atomic64_set(&global_stats.opens, 0);
+    atomic64_set(&global_stats.closes, 0);
+    atomic64_set(&global_stats.messages_read, 0);
+    atomic64_set(&global_stats.messages_written, 0);
+    atomic64_set(&global_stats.bytes_read, 0);
+    atomic64_set(&global_stats.bytes_written, 0);
+    atomic64_set(&global_stats.async_jobs, 0);
+
     message_work_queue = alloc_ordered_workqueue("jne_demo_wq", 0);
     if (!message_work_queue)
         return -ENOMEM;
@@ -580,6 +641,22 @@ static int __init jne_demo_init(void)
             debugfs_directory,
             NULL,
             &jne_demo_debugfs_status_fops)) {
+        debugfs_remove_recursive(debugfs_directory);
+        debugfs_directory = NULL;
+
+        misc_deregister(&jne_demo_device);
+        destroy_workqueue(message_work_queue);
+        message_work_queue = NULL;
+
+        return -ENOMEM;
+    }
+
+    if (!debugfs_create_file(
+           "stats",
+            0444,
+            debugfs_directory,
+            NULL,
+            &jne_demo_debugfs_stats_fops)) {
         debugfs_remove_recursive(debugfs_directory);
         debugfs_directory = NULL;
 

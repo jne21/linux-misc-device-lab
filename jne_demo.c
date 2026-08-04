@@ -8,6 +8,7 @@
 #include <linux/poll.h>
 #include <linux/kfifo.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 
 #include "jne_demo_ioctl.h"
 
@@ -29,6 +30,13 @@ struct jne_demo_message {
     size_t length;
     char data[BUFFER_SIZE];
 };
+
+struct jne_demo_work {
+    struct work_struct work;
+    struct jne_demo_message message;
+};
+
+static struct workqueue_struct *message_work_queue;
 
 static DEFINE_KFIFO(message_queue, struct jne_demo_message, QUEUE_CAPACITY);
 static DEFINE_MUTEX(message_queue_mutex);
@@ -108,20 +116,55 @@ unlock:
 
 //--------------------------------------------------------------------------------
 
+static void jne_demo_process_message(struct work_struct *work)
+{
+    struct jne_demo_work *message_work = container_of(work, struct jne_demo_work, work);
+    unsigned int checksum = 0;
+    size_t index;
+
+    for (index = 0; index < message_work->message.length; index++)
+        checksum += (unsigned char)message_work->message.data[index];
+
+    pr_info(
+        "jne_demo: asynchronously processed %zu bytes, checksum=%u\n",
+        message_work->message.length,
+        checksum);
+
+    kfree(message_work);
+}
+
+//--------------------------------------------------------------------------------
+
 static ssize_t jne_demo_write(struct file *file, const char __user *buffer, size_t count, loff_t *offset)
 {
     struct jne_demo_file_state *state = file->private_data;
-    struct jne_demo_message message;
-    size_t bytes_to_copy = min(count, (size_t)BUFFER_SIZE - 1);
+    struct jne_demo_work *message_work;
+    size_t bytes_to_copy;
     ssize_t result;
 
     if (count == 0)
         return 0;
 
+    bytes_to_copy = min(count, (size_t)BUFFER_SIZE - 1);
+
+    message_work = kzalloc(sizeof(*message_work), GFP_KERNEL);
+    if (!message_work)
+        return -ENOMEM;
+
+    if (copy_from_user(message_work->message.data, buffer, bytes_to_copy)) {
+        kfree(message_work);
+        return -EFAULT;
+    }
+
+    message_work->message.data[bytes_to_copy] = '\0';
+    message_work->message.length = bytes_to_copy;
+
 wait_for_space:
     if (atomic_read(&message_count) >= QUEUE_CAPACITY) {
-        if (file->f_flags & O_NONBLOCK)
-            return -EAGAIN;
+        if (file->f_flags & O_NONBLOCK) {
+            result = -EAGAIN;
+            goto free_work;
+        }
 
         pr_info("jne_demo: waiting for queue space\n");
 
@@ -130,30 +173,20 @@ wait_for_space:
             atomic_read(&message_count) < QUEUE_CAPACITY);
 
         if (result)
-            return result;
+            goto free_work;
     }
 
-    if (mutex_lock_interruptible(&message_queue_mutex))
-        return -ERESTARTSYS;
+    if (mutex_lock_interruptible(&message_queue_mutex)) {
+        result = -ERESTARTSYS;
+        goto free_work;
+    }
 
-    /*
-     * Інший writer міг зайняти останнє місце між перевіркою
-     * умови та отриманням mutex.
-     */
     if (kfifo_is_full(&message_queue)) {
         mutex_unlock(&message_queue_mutex);
         goto wait_for_space;
     }
 
-    if (copy_from_user(message.data, buffer, bytes_to_copy)) {
-        result = -EFAULT;
-        goto unlock;
-    }
-
-    message.data[bytes_to_copy] = '\0';
-    message.length = bytes_to_copy;
-
-    if (!kfifo_put(&message_queue, message)) {
+    if (!kfifo_put(&message_queue, message_work->message)) {
         mutex_unlock(&message_queue_mutex);
         goto wait_for_space;
     }
@@ -166,20 +199,24 @@ wait_for_space:
         state->bytes_written += bytes_to_copy;
     }
 
- 
     pr_info(
         "jne_demo: queued %zu bytes, %d messages available\n",
         bytes_to_copy,
         atomic_read(&message_count));
 
-unlock:
     mutex_unlock(&message_queue_mutex);
 
-    if (result >= 0)
-        wake_up_interruptible(&read_wait_queue);
+    INIT_WORK(&message_work->work, jne_demo_process_message);
+    queue_work(message_work_queue, &message_work->work);
 
+    wake_up_interruptible(&read_wait_queue);
+    return result;
+
+free_work:
+    kfree(message_work);
     return result;
 }
+
 //--------------------------------------------------------------------------------
 
 static long jne_demo_ioctl(struct file *file, unsigned int command, unsigned long argument)
@@ -330,24 +367,37 @@ static struct miscdevice jne_demo_device = {
 
 static int __init jne_demo_init(void)
 {
-    int result = misc_register(&jne_demo_device);
+    int result;
 
     kfifo_reset(&message_queue);
     atomic_set(&message_count, 0);
 
+    message_work_queue = alloc_ordered_workqueue("jne_demo_wq", 0);
+    if (!message_work_queue)
+        return -ENOMEM;
+
+    result = misc_register(&jne_demo_device);
     if (result) {
+        destroy_workqueue(message_work_queue);
+        message_work_queue = NULL;
+
         pr_err("jne_demo: failed to register device: %d\n", result);
         return result;
     }
 
-    pr_info("jne_demo: module loaded, device /dev/%s registered\n", DEVICE_NAME);
+    pr_info("jne_demo: module loaded\n");
     return 0;
 }
+
 //--------------------------------------------------------------------------------
 
 static void __exit jne_demo_exit(void)
 {
     misc_deregister(&jne_demo_device);
+
+    destroy_workqueue(message_work_queue);
+    message_work_queue = NULL;
+
     pr_info("jne_demo: module unloaded\n");
 }
 

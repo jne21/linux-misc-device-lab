@@ -1,0 +1,19 @@
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+*.order
+*.symvers
+
+.tmp_versions/
+modules.order
+Module.symvers
+
+# User-space binary
+nonblock_read
+
+# Editor settings
+.vscode/

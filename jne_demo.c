@@ -5,6 +5,7 @@
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+#include <linux/poll.h>
 
 #define DEVICE_NAME "jne_demo"
 #define BUFFER_SIZE 256
@@ -99,6 +100,23 @@ unlock:
     return result;
 }
 
+
+//--------------------------------------------------------------------------------
+
+static __poll_t jne_demo_poll(struct file *file, poll_table *wait)
+{
+    __poll_t mask = 0;
+
+    poll_wait(file, &data_wait_queue, wait);
+
+    if (READ_ONCE(data_available))
+        mask |= EPOLLIN | EPOLLRDNORM;
+
+    mask |= EPOLLOUT | EPOLLWRNORM;
+
+    return mask;
+}
+
 //--------------------------------------------------------------------------------
 
 static int jne_demo_open(struct inode *inode, struct file *file)
@@ -120,6 +138,7 @@ static const struct file_operations jne_demo_fops = {
     .open = jne_demo_open,
     .read = jne_demo_read,
     .write = jne_demo_write,
+    .poll = jne_demo_poll,
     .release = jne_demo_release,
 };
 

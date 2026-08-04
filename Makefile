@@ -4,7 +4,7 @@ KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(CURDIR)
 BIN_DIR := $(PWD)/bin
 
-USER_PROGRAMS := nonblock_read nonblock_write poll_read ioctl_test
+USER_PROGRAMS := 
 
 obj-m := $(MODULE_NAME).o
 

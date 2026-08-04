@@ -16,10 +16,26 @@
 #define DEVICE_NAME "jne_demo"
 #define BUFFER_SIZE 256
 #define QUEUE_CAPACITY 16
-#define STATUS_INTERVAL_MS 5000
 
 //--------------------------------------------------------------------------------
 
+static bool status_reporting = true;
+static unsigned int status_interval_ms = 5000;
+
+static int jne_demo_set_status_interval(const char *value, const struct kernel_param *parameter);
+
+static const struct kernel_param_ops status_interval_ops = {
+    .set = jne_demo_set_status_interval,
+    .get = param_get_uint,
+};
+
+module_param(status_reporting, bool, 0444);
+MODULE_PARM_DESC(status_reporting, "Enable periodic queue status reporting");
+
+module_param_cb(status_interval_ms, &status_interval_ops, &status_interval_ms, 0644);
+MODULE_PARM_DESC(status_interval_ms, "Queue status reporting interval in milliseconds, minimum 200");
+
+//--------------------------------------------------------------------------------
 
 struct jne_demo_file_state {
     unsigned long messages_read;
@@ -312,6 +328,24 @@ static __poll_t jne_demo_poll(struct file *file, poll_table *wait)
 
 //--------------------------------------------------------------------------------
 
+static int jne_demo_set_status_interval(const char *value, const struct kernel_param *parameter)
+{
+    unsigned int interval;
+    int result;
+
+    result = kstrtouint(value, 0, &interval);
+    if (result)
+        return result;
+
+    if (interval < 100)
+        return -EINVAL;
+
+    *(unsigned int *)parameter->arg = interval;
+    return 0;
+}
+
+//--------------------------------------------------------------------------------
+
 static int jne_demo_open(struct inode *inode, struct file *file)
 {
     struct jne_demo_file_state *state;
@@ -388,7 +422,7 @@ static void jne_demo_status_work(struct work_struct *work)
         queue_delayed_work(
             message_work_queue,
             &status_work,
-            msecs_to_jiffies(STATUS_INTERVAL_MS));
+            msecs_to_jiffies(status_interval_ms));
 }
 
 //--------------------------------------------------------------------------------
@@ -417,12 +451,20 @@ static int __init jne_demo_init(void)
         return result;
     }
 
-    queue_delayed_work(
-        message_work_queue,
-        &status_work,
-        msecs_to_jiffies(STATUS_INTERVAL_MS));
+    if (status_reporting)
+        queue_delayed_work(
+            message_work_queue,
+            &status_work,
+            msecs_to_jiffies(status_interval_ms));
+
+
+    pr_info(
+        "jne_demo: status reporting %s, interval=%u ms\n",
+        status_reporting ? "enabled" : "disabled",
+        status_interval_ms);
 
     pr_info("jne_demo: module loaded\n");
+
     return 0;
 }
 

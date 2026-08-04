@@ -8,6 +8,7 @@
 *.order
 *.symvers
 
+bin/
 .tmp_versions/
 modules.order
 Module.symvers

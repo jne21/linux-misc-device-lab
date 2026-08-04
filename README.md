@@ -1402,7 +1402,6 @@ Recommended precautions:
 * [x] `debugfs` status interface
 * [x] `debugfs` queue inspection
 * [x] `debugfs` global statistics
-* [ ] Device Tree and platform-driver example
 
 ## Development Path
 

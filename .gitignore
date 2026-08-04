@@ -14,7 +14,10 @@ Module.symvers
 
 # User-space binary
 nonblock_read
+nonblock_write
 poll_read
+ioctl_test
+
 
 # Editor settings
 .vscode/

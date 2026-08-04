@@ -10,6 +10,8 @@
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <linux/jiffies.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
 
 #include "jne_demo_ioctl.h"
 
@@ -23,6 +25,10 @@ static bool status_reporting = true;
 static unsigned int status_interval_ms = 5000;
 
 static int jne_demo_set_status_interval(const char *value, const struct kernel_param *parameter);
+static int jne_demo_debugfs_status_show(struct seq_file *file, void *data);
+static int jne_demo_debugfs_status_open(struct inode *inode, struct file *file);
+static int jne_demo_debugfs_messages_show(struct seq_file *file, void *data);
+static int jne_demo_debugfs_messages_open(struct inode *inode, struct file *file);
 
 static const struct kernel_param_ops status_interval_ops = {
     .set = jne_demo_set_status_interval,
@@ -54,6 +60,22 @@ struct jne_demo_work {
     struct jne_demo_message message;
 };
 
+static const struct file_operations jne_demo_debugfs_status_fops = {
+    .owner = THIS_MODULE,
+    .open = jne_demo_debugfs_status_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+static const struct file_operations jne_demo_debugfs_messages_fops = {
+    .owner = THIS_MODULE,
+    .open = jne_demo_debugfs_messages_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
 static struct workqueue_struct *message_work_queue;
 
 static DEFINE_KFIFO(message_queue, struct jne_demo_message, QUEUE_CAPACITY);
@@ -64,6 +86,8 @@ static DECLARE_WAIT_QUEUE_HEAD(read_wait_queue);
 static DECLARE_WAIT_QUEUE_HEAD(write_wait_queue);
 
 static struct delayed_work status_work;
+static struct dentry *debugfs_directory;
+
 static bool module_stopping;
 
 //--------------------------------------------------------------------------------
@@ -346,6 +370,77 @@ static int jne_demo_set_status_interval(const char *value, const struct kernel_p
 
 //--------------------------------------------------------------------------------
 
+static int jne_demo_debugfs_status_show(struct seq_file *file, void *data)
+{
+    int count;
+
+    (void)data;
+
+    count = atomic_read(&message_count);
+
+    seq_printf(file, "messages: %d\n", count);
+    seq_printf(file, "capacity: %d\n", QUEUE_CAPACITY);
+    seq_printf(file, "available: %d\n", QUEUE_CAPACITY - count);
+    seq_printf(file, "status_reporting: %s\n", status_reporting ? "enabled" : "disabled");
+    seq_printf(file, "status_interval_ms: %u\n", status_interval_ms);
+
+    return 0;
+}
+
+static int jne_demo_debugfs_status_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, jne_demo_debugfs_status_show, inode->i_private);
+}
+
+//--------------------------------------------------------------------------------
+
+static int jne_demo_debugfs_messages_show(struct seq_file *file, void *data)
+{
+    struct jne_demo_message *messages;
+    unsigned int message_count_snapshot;
+    unsigned int copied;
+    unsigned int index;
+
+    (void)data;
+
+    messages = kcalloc(QUEUE_CAPACITY, sizeof(*messages), GFP_KERNEL);
+    if (!messages)
+        return -ENOMEM;
+
+    mutex_lock(&message_queue_mutex);
+
+    message_count_snapshot = atomic_read(&message_count);
+    copied = kfifo_out_peek(&message_queue, messages, message_count_snapshot);
+
+    mutex_unlock(&message_queue_mutex);
+
+    seq_printf(file, "messages: %u\n", copied);
+
+    for (index = 0; index < copied; index++) {
+        seq_printf(
+            file,
+            "[%u] length=%zu data=\"%.*s\"\n",
+            index,
+            messages[index].length,
+            (int)messages[index].length,
+            messages[index].data);
+    }
+
+    kfree(messages);
+    return 0;
+}
+
+static int jne_demo_debugfs_messages_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, jne_demo_debugfs_messages_show, inode->i_private);
+}
+
+//--------------------------------------------------------------------------------
+//--------------------------------------------------------------------------------
+//--------------------------------------------------------------------------------
+//--------------------------------------------------------------------------------
+
+
 static int jne_demo_open(struct inode *inode, struct file *file)
 {
     struct jne_demo_file_state *state;
@@ -451,6 +546,50 @@ static int __init jne_demo_init(void)
         return result;
     }
 
+    debugfs_directory = debugfs_create_dir("jne_demo", NULL);
+    if (IS_ERR(debugfs_directory)) {
+        result = PTR_ERR(debugfs_directory);
+        debugfs_directory = NULL;
+
+        misc_deregister(&jne_demo_device);
+        destroy_workqueue(message_work_queue);
+        message_work_queue = NULL;
+
+        return result;
+    }
+ 
+    if (!debugfs_create_file(
+            "messages",
+            0444,
+            debugfs_directory,
+            NULL,
+            &jne_demo_debugfs_messages_fops)) {
+        debugfs_remove_recursive(debugfs_directory);
+        debugfs_directory = NULL;
+
+        misc_deregister(&jne_demo_device);
+        destroy_workqueue(message_work_queue);
+        message_work_queue = NULL;
+
+        return -ENOMEM;
+    }
+
+    if (!debugfs_create_file(
+            "status",
+            0444,
+            debugfs_directory,
+            NULL,
+            &jne_demo_debugfs_status_fops)) {
+        debugfs_remove_recursive(debugfs_directory);
+        debugfs_directory = NULL;
+
+        misc_deregister(&jne_demo_device);
+        destroy_workqueue(message_work_queue);
+        message_work_queue = NULL;
+
+        return -ENOMEM;
+    }
+
     if (status_reporting)
         queue_delayed_work(
             message_work_queue,
@@ -472,6 +611,9 @@ static int __init jne_demo_init(void)
 
 static void __exit jne_demo_exit(void)
 {
+    debugfs_remove_recursive(debugfs_directory);
+    debugfs_directory = NULL;
+
     misc_deregister(&jne_demo_device);
 
     WRITE_ONCE(module_stopping, true);

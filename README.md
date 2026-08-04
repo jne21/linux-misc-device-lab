@@ -1267,6 +1267,7 @@ Recommended precautions:
 * [x] Separate `bin/` build output
 * [x] Automated integration tests
 * [x] CI build verification
+* [x] `debugfs` diagnostics
 * [ ] Device Tree and platform-driver example
 
 ## Development Path

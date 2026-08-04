@@ -4,41 +4,42 @@
 ![Language](https://img.shields.io/badge/language-C-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 ![Kernel Module](https://img.shields.io/badge/type-kernel%20module-orange)
-![Status](https://img.shields.io/badge/status-learning%20project-green)
+![Status](https://img.shields.io/badge/status-demonstration%20project-green)
 
-An demonstration Linux kernel module that implements a message-oriented miscellaneous character device:
+A demonstration Linux kernel module that implements a message-oriented miscellaneous character device:
 
 ```text
 /dev/jne_demo
 ```
 
-The project demonstrates communication between user space and kernel space through standard Linux file operations, blocking and non-blocking I/O, wait queues, polling, synchronization, `ioctl()` commands, typed kernel FIFO storage, per-open state, asynchronous workqueue processing, and periodic delayed work.
+The project demonstrates communication between user space and kernel space through standard Linux file operations, blocking and non-blocking I/O, wait queues, polling, synchronization, `ioctl()` commands, typed kernel FIFO storage, per-open state, asynchronous workqueue processing, periodic delayed work, configurable module parameters, and automated tests.
 
 ## Features
 
-| Feature                   | Implementation                  |
-| ------------------------- | ------------------------------- |
-| Character device          | Linux `miscdevice` API          |
-| Device path               | `/dev/jne_demo`                 |
-| Message storage           | Typed `kfifo`                   |
-| Queue capacity            | 16 messages                     |
-| Maximum message size      | 255 bytes                       |
-| Reading                   | `read()` callback               |
-| Writing                   | `write()` callback              |
-| User-to-kernel transfer   | `copy_from_user()`              |
-| Kernel-to-user transfer   | `copy_to_user()`                |
-| Queue synchronization     | Kernel `mutex`                  |
-| Queue state               | `atomic_t` message counter      |
-| Blocking reads            | Reader wait queue               |
-| Blocking writes           | Writer wait queue               |
-| Non-blocking I/O          | `O_NONBLOCK` and `-EAGAIN`      |
-| Readiness notification    | `poll()`, `select()`, `epoll()` |
-| Control commands          | `ioctl()`                       |
-| Per-open statistics       | `file->private_data`            |
-| Asynchronous processing   | Ordered kernel workqueue        |
-| Periodic status reporting | `delayed_work` every 5 seconds  |
-| Diagnostics               | `pr_info()` and `dmesg`         |
-| Build output              | `bin/` directory                |
+| Feature                   | Implementation                            |
+| ------------------------- | ----------------------------------------- |
+| Character device          | Linux `miscdevice` API                    |
+| Device path               | `/dev/jne_demo`                           |
+| Message storage           | Typed `kfifo`                             |
+| Queue capacity            | 16 messages                               |
+| Maximum message size      | 255 bytes                                 |
+| Reading                   | `read()` callback                         |
+| Writing                   | `write()` callback                        |
+| User-to-kernel transfer   | `copy_from_user()`                        |
+| Kernel-to-user transfer   | `copy_to_user()`                          |
+| Queue synchronization     | Kernel `mutex`                            |
+| Queue state               | `atomic_t` message counter                |
+| Blocking reads            | Reader wait queue                         |
+| Blocking writes           | Writer wait queue                         |
+| Non-blocking I/O          | `O_NONBLOCK` and `-EAGAIN`                |
+| Readiness notification    | `poll()`, `select()`, `epoll()`           |
+| Control commands          | `ioctl()`                                 |
+| Per-open statistics       | `file->private_data`                      |
+| Asynchronous processing   | Ordered kernel workqueue                  |
+| Periodic status reporting | Configurable `delayed_work` interval      |
+| Runtime configuration     | Writable module parameter through `sysfs` |
+| Diagnostics               | `pr_info()` and `dmesg`                   |
+| Build output              | `bin/` directory                          |
 
 ## Architecture
 
@@ -72,6 +73,7 @@ The project demonstrates communication between user space and kernel space throu
 │  per-open file state                          │
 │  ordered workqueue                            │
 │  periodic delayed work                        │
+│  validated module parameters                  │
 └──────────────────────┬────────────────────────┘
                        │
                asynchronous work
@@ -184,11 +186,16 @@ The original message remains in the FIFO and can still be read through `/dev/jne
 
 The module periodically reports the current FIFO state through a delayed work item.
 
-The reporting interval is configured as:
+The default reporting configuration is stored in module parameters:
 
 ```c
-#define STATUS_INTERVAL_MS 5000
+static bool status_reporting = true;
+static unsigned int status_interval_ms = 5000;
 ```
+
+The `status_reporting` parameter enables or disables periodic status reporting when the module is loaded.
+
+The `status_interval_ms` parameter controls the interval between status reports. Its default value is 5000 milliseconds.
 
 A static delayed work object is used:
 
@@ -217,7 +224,7 @@ static void jne_demo_status_work(struct work_struct *work)
         queue_delayed_work(
             message_work_queue,
             &status_work,
-            msecs_to_jiffies(STATUS_INTERVAL_MS));
+            msecs_to_jiffies(status_interval_ms));
 }
 ```
 
@@ -230,10 +237,11 @@ INIT_DELAYED_WORK(&status_work, jne_demo_status_work);
 The first execution is scheduled after the device has been registered:
 
 ```c
-queue_delayed_work(
-    message_work_queue,
-    &status_work,
-    msecs_to_jiffies(STATUS_INTERVAL_MS));
+if (status_reporting)
+    queue_delayed_work(
+        message_work_queue,
+        &status_work,
+        msecs_to_jiffies(status_interval_ms));
 ```
 
 Each callback schedules the next execution, creating periodic status reporting without a busy loop.
@@ -241,7 +249,7 @@ Each callback schedules the next execution, creating periodic status reporting w
 The interval is converted from milliseconds to kernel ticks with:
 
 ```c
-msecs_to_jiffies(STATUS_INTERVAL_MS)
+msecs_to_jiffies(status_interval_ms)
 ```
 
 Example kernel log output:
@@ -279,7 +287,7 @@ if (!READ_ONCE(module_stopping))
     queue_delayed_work(
         message_work_queue,
         &status_work,
-        msecs_to_jiffies(STATUS_INTERVAL_MS));
+        msecs_to_jiffies(status_interval_ms));
 ```
 
 The delayed work is cancelled synchronously before the workqueue is destroyed:
@@ -291,6 +299,177 @@ destroy_workqueue(message_work_queue);
 ```
 
 `cancel_delayed_work_sync()` cancels a pending delayed execution and waits for a currently running callback to finish.
+
+## Module Parameters
+
+The module exposes two configuration parameters:
+
+| Parameter            | Type   | Default | Runtime writable | Description                             |
+| -------------------- | ------ | ------- | ---------------- | --------------------------------------- |
+| `status_reporting`   | `bool` | `true`  | No               | Enables periodic queue status reporting |
+| `status_interval_ms` | `uint` | `5000`  | Yes              | Sets the reporting interval in ms       |
+
+The parameters are registered as:
+
+```c
+module_param(status_reporting, bool, 0444);
+MODULE_PARM_DESC(
+    status_reporting,
+    "Enable periodic queue status reporting");
+```
+
+The reporting interval uses a custom setter:
+
+```c
+module_param_cb(
+    status_interval_ms,
+    &status_interval_ops,
+    &status_interval_ms,
+    0644);
+
+MODULE_PARM_DESC(
+    status_interval_ms,
+    "Queue status reporting interval in milliseconds, minimum 100");
+```
+
+The custom setter validates both values passed through `insmod` and values written later through `sysfs`:
+
+```c
+static int jne_demo_set_status_interval(
+    const char *value,
+    const struct kernel_param *parameter)
+{
+    unsigned int interval;
+    int result;
+
+    result = kstrtouint(value, 0, &interval);
+    if (result)
+        return result;
+
+    if (interval < 100)
+        return -EINVAL;
+
+    *(unsigned int *)parameter->arg = interval;
+    return 0;
+}
+```
+
+The minimum supported interval is 100 milliseconds.
+
+### Loading With Parameters
+
+Use the default configuration:
+
+```bash
+sudo insmod bin/jne_demo.ko
+```
+
+Use a two-second reporting interval:
+
+```bash
+sudo insmod bin/jne_demo.ko status_interval_ms=2000
+```
+
+Disable periodic reporting:
+
+```bash
+sudo insmod bin/jne_demo.ko status_reporting=false
+```
+
+Use both parameters:
+
+```bash
+sudo insmod bin/jne_demo.ko \
+    status_reporting=true \
+    status_interval_ms=1000
+```
+
+An invalid interval is rejected:
+
+```bash
+sudo insmod bin/jne_demo.ko status_interval_ms=10
+```
+
+Expected result:
+
+```text
+insmod: ERROR: could not insert module bin/jne_demo.ko: Invalid parameters
+```
+
+### Reading Parameters Through `sysfs`
+
+After the module is loaded:
+
+```bash
+cat /sys/module/jne_demo/parameters/status_reporting
+cat /sys/module/jne_demo/parameters/status_interval_ms
+```
+
+Example output:
+
+```text
+Y
+5000
+```
+
+### Changing the Interval at Runtime
+
+The interval can be changed without unloading the module:
+
+```bash
+echo 2000 | sudo tee /sys/module/jne_demo/parameters/status_interval_ms
+```
+
+Verify the new value:
+
+```bash
+cat /sys/module/jne_demo/parameters/status_interval_ms
+```
+
+Expected output:
+
+```text
+2000
+```
+
+The new interval is used the next time the delayed work schedules itself.
+
+A delayed work item that is already waiting keeps its current delay. After it runs, the following execution uses the updated interval.
+
+Invalid runtime values are rejected:
+
+```bash
+echo 10 | sudo tee /sys/module/jne_demo/parameters/status_interval_ms
+```
+
+Expected result:
+
+```text
+tee: /sys/module/jne_demo/parameters/status_interval_ms: Invalid argument
+```
+
+Non-numeric values are also rejected:
+
+```bash
+echo invalid | sudo tee /sys/module/jne_demo/parameters/status_interval_ms
+```
+
+The previous valid value remains unchanged.
+
+### Inspecting Module Metadata
+
+The available parameters can be inspected before loading the module:
+
+```bash
+sudo modinfo bin/jne_demo.ko | grep parm
+```
+
+Example output:
+
+```text
+parm:           status_reporting:Enable periodic queue status reporting (bool)
+parm:           status_interval_ms:Queue status reporting interval in milliseconds, minimum 100 (uint)
+```
 
 ## Per-Open State
 
@@ -336,6 +515,9 @@ When a file descriptor is closed, its statistics are written to the kernel log.
 
 ```text
 .
+├── .github/
+│   └── workflows/
+│       └── build.yml
 ├── jne_demo.c
 ├── jne_demo_ioctl.h
 ├── Makefile
@@ -360,13 +542,13 @@ The `bin/` directory contains generated binaries and is excluded from Git.
 
 ## Requirements
 
-The module must be built against the headers of the currently running Linux kernel.
+The module must be built against compatible Linux kernel headers.
 
 ### Debian
 
 ```bash
 sudo apt update
-sudo apt install build-essential linux-headers-$(uname -r)
+sudo apt install build-essential linux-headers-$(uname -r) kmod
 ```
 
 Initially tested with:
@@ -403,6 +585,14 @@ Remove generated files:
 ```bash
 make clean
 ```
+
+The kernel headers directory can be overridden explicitly:
+
+```bash
+make KDIR=/path/to/linux-headers
+```
+
+This is used by the GitHub Actions workflow to build the module against installed Ubuntu kernel headers.
 
 ## Load the Module
 
@@ -457,6 +647,7 @@ sudo dmesg -w
 Example messages:
 
 ```text
+jne_demo: status reporting enabled, interval=5000 ms
 jne_demo: module loaded
 jne_demo: device opened
 jne_demo: queued 12 bytes, 1 messages available
@@ -995,6 +1186,48 @@ All integration tests passed.
 
 The test script automatically unloads the module and removes temporary files when it finishes or fails.
 
+## Continuous Integration
+
+The repository contains a GitHub Actions workflow:
+
+```text
+.github/workflows/build.yml
+```
+
+The workflow runs when changes are pushed to the `main` branch, when a pull request targets `main`, or when it is started manually.
+
+It performs the following steps:
+
+```text
+checkout repository
+    ↓
+install compiler and kernel headers
+    ↓
+find the installed kernel headers directory
+    ↓
+build the kernel module
+    ↓
+build the user-space test programs
+    ↓
+verify generated output
+```
+
+The workflow verifies that these files are created:
+
+```text
+bin/jne_demo.ko
+bin/nonblock_read
+bin/nonblock_write
+bin/poll_read
+bin/ioctl_test
+bin/file_state_test
+```
+
+The GitHub-hosted runner does not load the kernel module. Full integration testing with `insmod`, `/dev/jne_demo`, and `rmmod` is performed locally through:
+
+```bash
+make test
+```
 
 ## Safety
 
@@ -1029,12 +1262,14 @@ Recommended precautions:
 * [x] Asynchronous message processing
 * [x] Periodic delayed work
 * [x] Safe delayed-work cancellation
+* [x] Validated module parameters
+* [x] Runtime interval configuration through `sysfs`
 * [x] Separate `bin/` build output
 * [x] Automated integration tests
 * [x] CI build verification
 * [ ] Device Tree and platform-driver example
 
-## Learning Path
+## Development Path
 
 ```text
 kernel module
@@ -1068,6 +1303,14 @@ delayed work
 periodic kernel tasks
     ↓
 safe asynchronous cancellation
+    ↓
+validated module parameters
+    ↓
+runtime configuration through sysfs
+    ↓
+automated integration testing
+    ↓
+continuous integration build verification
 ```
 
 ## License

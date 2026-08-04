@@ -14,6 +14,15 @@ A demonstration Linux kernel module that implements a message-oriented miscellan
 
 The project demonstrates communication between user space and kernel space through standard Linux file operations, blocking and non-blocking I/O, wait queues, polling, synchronization, `ioctl()` commands, typed kernel FIFO storage, per-open state, asynchronous workqueue processing, periodic delayed work, configurable module parameters, and automated tests.
 
+## Code Readability
+
+The kernel module and integration test script are intentionally commented to make the implementation easier to understand.
+
+Comments explain the purpose of the main structures and subsystems, synchronization decisions, blocking and non-blocking control flow, wait-queue rechecks, workqueue ownership, resource cleanup, module lifecycle, and the organization of the integration tests.
+
+The comments focus on non-obvious kernel and test behavior rather than restating every line of code.
+
+
 ## Features
 
 | Feature                   | Implementation                            |
@@ -670,6 +679,11 @@ When a file descriptor is closed, its statistics are written to the kernel log.
 ```
 
 The `bin/` directory contains generated binaries and is excluded from Git.
+
+The main source files are deliberately documented inline:
+
+* `jne_demo.c` contains comments describing driver architecture, synchronization and resource lifetime;
+* `test.sh` contains comments describing test isolation, assertions, asynchronous waits and cleanup behavior.
 
 ## Requirements
 
@@ -1398,6 +1412,7 @@ Recommended precautions:
 * [x] Separate `bin/` build output
 * [x] Automated integration tests
 * [x] CI build verification
+* [x] Commented source and integration tests
 * [x] `debugfs` diagnostics
 * [x] `debugfs` status interface
 * [x] `debugfs` queue inspection

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 
+# Stop on errors, unset variables and failed pipeline elements.
+# ERR traps are inherited by functions and subshells through -E.
 set -Eeuo pipefail
 
+# Resolve every project path relative to the script itself so the tests can be
+# started from any current working directory.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$ROOT_DIR/bin"
 
@@ -17,21 +21,28 @@ DEBUGFS_STATS_PATH="$DEBUGFS_DIR/stats"
 
 STATUS_INTERVAL_PATH="/sys/module/$MODULE_NAME/parameters/status_interval_ms"
 
+# Temporary files contain output captured from helper test programs.
 TEMP_DIR="$(mktemp -d)"
+
+# Track resources created by the test so cleanup removes only what belongs to
+# this execution.
 DEBUGFS_MOUNTED_BY_TEST=false
 POLL_PID=""
 
+# Print a consistent failure message. exit triggers the cleanup trap.
 fail()
 {
     echo "FAIL: $1" >&2
     exit 1
 }
 
+# Report one completed integration-test stage.
 pass()
 {
     echo "PASS: $1"
 }
 
+# Compare complete strings and include both values in a useful failure message.
 assert_equals()
 {
     local expected="$1"
@@ -43,6 +54,7 @@ assert_equals()
     fi
 }
 
+# Require one exact line in a file. Fixed-string matching avoids regex surprises.
 assert_file_contains_line()
 {
     local file="$1"
@@ -54,6 +66,7 @@ assert_file_contains_line()
     fi
 }
 
+# Exact-line assertion for output already stored in a shell variable.
 assert_text_contains_line()
 {
     local text="$1"
@@ -65,6 +78,7 @@ assert_text_contains_line()
     fi
 }
 
+# Extract a value from debugfs/stats lines formatted as "name: value".
 get_stat()
 {
     local name="$1"
@@ -73,6 +87,7 @@ get_stat()
     awk -F ': ' -v name="$name" '$1 == name { print $2 }' <<< "$content"
 }
 
+# Validate counters before using them in shell arithmetic.
 assert_unsigned_integer()
 {
     local value="$1"
@@ -83,11 +98,15 @@ assert_unsigned_integer()
     fi
 }
 
+# ioctl_test starts by clearing the FIFO. Its output is irrelevant here, so this
+# helper makes queue preparation explicit at the beginning of each test.
 clear_queue()
 {
     "$BIN_DIR/ioctl_test" >/dev/null
 }
 
+# Device nodes may appear shortly after insmod returns. Poll for a bounded time
+# instead of relying on a fixed sleep.
 wait_for_device()
 {
     local attempt
@@ -103,6 +122,8 @@ wait_for_device()
     fail "$DEVICE_PATH was not created"
 }
 
+# Workqueue processing is asynchronous. Poll one global counter until the
+# expected value appears, then return the complete statistics snapshot.
 wait_for_stat()
 {
     local name="$1"
@@ -126,6 +147,8 @@ wait_for_stat()
     fail "Timed out waiting for $name=$expected"
 }
 
+# Mount debugfs only when it is not already mounted. cleanup() unmounts it only
+# when this script performed the mount.
 mount_debugfs()
 {
     if grep -qs " $DEBUGFS_ROOT debugfs " /proc/mounts; then
@@ -136,18 +159,23 @@ mount_debugfs()
     DEBUGFS_MOUNTED_BY_TEST=true
 }
 
+# Start every run with a fresh module instance and zeroed global state.
 load_module()
 {
+    # Ignore a missing old module; insmod must still fail normally on errors.
     sudo rmmod "$MODULE_NAME" 2>/dev/null || true
     sudo insmod "$MODULE_PATH"
     wait_for_device
 }
 
+# Normal module removal used by the final test.
 unload_module()
 {
     sudo rmmod "$MODULE_NAME"
 }
 
+# Best-effort cleanup for successful runs, assertion failures and interruptions.
+# Every operation is safe when the corresponding resource was not created.
 cleanup()
 {
     if [[ -n "$POLL_PID" ]]; then
@@ -163,12 +191,14 @@ cleanup()
     fi
 }
 
+# Verify the visible result of misc_register(): a character device node.
 test_module_loading()
 {
     [[ -c "$DEVICE_PATH" ]] || fail "$DEVICE_PATH was not created"
     pass "Module loading and device creation"
 }
 
+# Verify creation of the diagnostic interface and its initial queue snapshot.
 test_debugfs_status()
 {
     local status_output
@@ -206,6 +236,7 @@ test_debugfs_status()
     pass "debugfs status interface"
 }
 
+# An empty FIFO opened with O_NONBLOCK must return -EAGAIN to user space.
 test_nonblocking_read()
 {
     local output
@@ -219,6 +250,7 @@ test_nonblocking_read()
     pass "Non-blocking read from empty queue"
 }
 
+# Confirm that debugfs/messages shows FIFO contents without consuming them.
 test_debugfs_messages()
 {
     local messages_output
@@ -250,6 +282,9 @@ test_debugfs_messages()
     pass "debugfs queue inspection"
 }
 
+# Compare statistics before and after one controlled write/read pair.
+# Deltas are tested instead of absolute values because earlier tests also open
+# the device and may update module-wide counters.
 test_debugfs_stats()
 {
     local stats_before
@@ -274,6 +309,9 @@ test_debugfs_stats()
     local async_jobs_expected
 
     clear_queue
+
+    # ioctl_test itself opens and closes the device before this snapshot. That
+    # does not matter because all assertions below use relative increments.
     stats_before="$(sudo cat "$DEBUGFS_STATS_PATH")"
 
     opens_before="$(get_stat opens "$stats_before")"
@@ -298,6 +336,8 @@ test_debugfs_stats()
     assert_equals "Stats message" "$stats_message" \
         "Statistics test did not read the expected message"
 
+    # write() queues checksum work asynchronously, so wait for the worker
+    # instead of assuming it has completed when read() returns.
     async_jobs_expected=$((async_jobs_before + 1))
     stats_after="$(wait_for_stat async_jobs "$async_jobs_expected")"
 
@@ -333,6 +373,8 @@ test_debugfs_stats()
     pass "debugfs global statistics"
 }
 
+# Confirm that the validated module parameter accepts a legal runtime value,
+# rejects an illegal one and preserves the previous valid value.
 test_runtime_module_parameter()
 {
     local actual_interval
@@ -355,6 +397,7 @@ test_runtime_module_parameter()
     pass "Validated runtime module parameter"
 }
 
+# Write three complete messages and verify first-in, first-out delivery.
 test_fifo_order()
 {
     local first
@@ -378,12 +421,14 @@ test_fifo_order()
     pass "FIFO message order"
 }
 
+# Start a reader waiting in poll(), then write a message and verify wake-up.
 test_poll_notification()
 {
     local output_file="$TEMP_DIR/poll-output.txt"
 
     clear_queue
 
+    # timeout prevents a broken poll implementation from hanging the suite.
     timeout 3 "$BIN_DIR/poll_read" > "$output_file" &
     POLL_PID=$!
 
@@ -400,6 +445,7 @@ test_poll_notification()
     pass "poll() notification"
 }
 
+# Exercise GET_LENGTH and CLEAR through the shared user/kernel ioctl interface.
 test_ioctl_commands()
 {
     local output_file="$TEMP_DIR/ioctl-output.txt"
@@ -420,6 +466,7 @@ test_ioctl_commands()
     pass "ioctl commands"
 }
 
+# Verify that file->private_data statistics belong to one open descriptor.
 test_per_open_statistics()
 {
     local output_file="$TEMP_DIR/state-output.txt"
@@ -436,6 +483,7 @@ test_per_open_statistics()
     pass "Per-open statistics"
 }
 
+# Fill all FIFO slots and verify that an O_NONBLOCK writer receives -EAGAIN.
 test_nonblocking_write()
 {
     local index
@@ -456,6 +504,7 @@ test_nonblocking_write()
     pass "Non-blocking write to full queue"
 }
 
+# Verify both externally visible cleanup results: /dev and debugfs disappear.
 test_module_unloading()
 {
     unload_module
@@ -470,6 +519,8 @@ test_module_unloading()
     pass "Module unloading and device removal"
 }
 
+# Keep the execution order in one place. Individual test functions prepare
+# their own queue state, which minimizes hidden dependencies between tests.
 main()
 {
     cd "$ROOT_DIR"
@@ -495,6 +546,8 @@ main()
     test_nonblocking_write
     test_module_unloading
 
+    # The explicit final cleanup below completed successfully. Remove the trap
+    # so it is not executed a second time when the script exits.
     trap - EXIT
     rm -rf "$TEMP_DIR"
 
@@ -506,5 +559,6 @@ main()
     echo "All integration tests passed."
 }
 
+# Install cleanup before any privileged resource is created.
 trap cleanup EXIT
 main "$@"

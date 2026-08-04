@@ -15,11 +15,23 @@
 
 #include "jne_demo_ioctl.h"
 
+/*
+ * Demonstration misc character device.
+ *
+ * The module exposes /dev/jne_demo and stores complete messages in a bounded
+ * FIFO. Readers and writers may operate in blocking or non-blocking mode.
+ */
 #define DEVICE_NAME "jne_demo"
 #define BUFFER_SIZE 256
 #define QUEUE_CAPACITY 16
 #define MIN_STATUS_INTERVAL_MS 100
 
+/*
+ * Statistics associated with one open file descriptor.
+ *
+ * A separate instance is allocated in open() and stored in file->private_data.
+ * Consequently, two processes that open the device see independent counters.
+ */
 struct jne_demo_file_state {
     unsigned long messages_read;
     unsigned long messages_written;
@@ -27,16 +39,34 @@ struct jne_demo_file_state {
     unsigned long bytes_written;
 };
 
+/*
+ * One FIFO element.
+ *
+ * The typed kfifo stores structures rather than individual bytes, so one read()
+ * returns exactly one message written by one write().
+ */
 struct jne_demo_message {
     size_t length;
     char data[BUFFER_SIZE];
 };
 
+/*
+ * Workqueue item used for deferred message processing.
+ *
+ * The message is copied into this allocation before write() returns. This keeps
+ * asynchronous processing independent of both user memory and the FIFO entry.
+ */
 struct jne_demo_work {
     struct work_struct work;
     struct jne_demo_message message;
 };
 
+/*
+ * Module-wide counters.
+ *
+ * These values may be updated concurrently by different processes and by the
+ * workqueue. atomic64_t prevents lost updates without requiring the FIFO mutex.
+ */
 struct jne_demo_global_stats {
     atomic64_t opens;
     atomic64_t closes;
@@ -47,21 +77,41 @@ struct jne_demo_global_stats {
     atomic64_t async_jobs;
 };
 
+/* Read-only-at-runtime switch controlling periodic status messages. */
 static bool status_reporting = true;
+
+/* Writable module parameter validated by jne_demo_set_status_interval(). */
 static unsigned int status_interval_ms = 5000;
 static bool module_stopping;
 
+/*
+ * Shared message queue.
+ *
+ * message_queue_mutex protects all structural kfifo operations. message_count
+ * is an atomic snapshot used by wait conditions and poll() without taking the
+ * mutex. The count is updated while the FIFO mutex is held.
+ */
 static DEFINE_KFIFO(message_queue, struct jne_demo_message, QUEUE_CAPACITY);
 static DEFINE_MUTEX(message_queue_mutex);
 static atomic_t message_count = ATOMIC_INIT(0);
 
+/*
+ * Readers sleep here while the FIFO is empty.
+ * Writers sleep here while the FIFO is full.
+ */
 static DECLARE_WAIT_QUEUE_HEAD(read_wait_queue);
 static DECLARE_WAIT_QUEUE_HEAD(write_wait_queue);
 
+/*
+ * Ordered workqueue guarantees that deferred message jobs execute in the same
+ * order in which write() queued them. status_work uses the same workqueue.
+ */
 static struct workqueue_struct *message_work_queue;
 static struct delayed_work status_work;
 static struct dentry *debugfs_directory;
 static struct jne_demo_global_stats global_stats;
+
+/* Module parameter handling. */
 
 static int jne_demo_set_status_interval(const char *value, const struct kernel_param *parameter);
 
@@ -89,6 +139,7 @@ static void jne_demo_reset_global_stats(void);
 static int __init jne_demo_init(void);
 static void __exit jne_demo_exit(void);
 
+/* Module parameters and operation tables. */
 static const struct kernel_param_ops status_interval_ops = {
     .set = jne_demo_set_status_interval,
     .get = param_get_uint,
@@ -141,6 +192,12 @@ static struct miscdevice jne_demo_device = {
     .mode = 0666,
 };
 
+/*
+ * Validate writes to /sys/module/jne_demo/parameters/status_interval_ms.
+ *
+ * module_param_cb() routes both the initial module argument and later sysfs
+ * writes through this setter.
+ */
 static int jne_demo_set_status_interval(const char *value, const struct kernel_param *parameter)
 {
     unsigned int interval;
@@ -159,6 +216,13 @@ static int jne_demo_set_status_interval(const char *value, const struct kernel_p
     return 0;
 }
 
+/* debugfs file implementations. */
+
+/*
+ * Produce a momentary queue/configuration snapshot for debugfs/status.
+ *
+ * seq_file handles buffering and repeated user-space reads correctly.
+ */
 static int jne_demo_debugfs_status_show(struct seq_file *file, void *data)
 {
     int count;
@@ -176,11 +240,18 @@ static int jne_demo_debugfs_status_show(struct seq_file *file, void *data)
     return 0;
 }
 
+/* Bind debugfs/status to its single-record seq_file producer. */
 static int jne_demo_debugfs_status_open(struct inode *inode, struct file *file)
 {
     return single_open(file, jne_demo_debugfs_status_show, inode->i_private);
 }
 
+/*
+ * Snapshot the FIFO for debugfs/messages without consuming messages.
+ *
+ * The mutex is held only while copying the FIFO contents. Formatting is done
+ * after unlocking so a slow debugfs reader does not block normal I/O.
+ */
 static int jne_demo_debugfs_messages_show(struct seq_file *file, void *data)
 {
     struct jne_demo_message *messages;
@@ -218,11 +289,13 @@ static int jne_demo_debugfs_messages_show(struct seq_file *file, void *data)
     return 0;
 }
 
+/* Bind debugfs/messages to its seq_file producer. */
 static int jne_demo_debugfs_messages_open(struct inode *inode, struct file *file)
 {
     return single_open(file, jne_demo_debugfs_messages_show, inode->i_private);
 }
 
+/* Export module-wide atomic counters through debugfs/stats. */
 static int jne_demo_debugfs_stats_show(struct seq_file *file, void *data)
 {
     (void)data;
@@ -238,11 +311,20 @@ static int jne_demo_debugfs_stats_show(struct seq_file *file, void *data)
     return 0;
 }
 
+/* Bind debugfs/stats to its seq_file producer. */
 static int jne_demo_debugfs_stats_open(struct inode *inode, struct file *file)
 {
     return single_open(file, jne_demo_debugfs_stats_show, inode->i_private);
 }
 
+/* Character-device file operations. */
+
+/*
+ * Create per-open state.
+ *
+ * open() is called once for each new file descriptor. The allocation survives
+ * until the corresponding release().
+ */
 static int jne_demo_open(struct inode *inode, struct file *file)
 {
     struct jne_demo_file_state *state;
@@ -261,6 +343,9 @@ static int jne_demo_open(struct inode *inode, struct file *file)
     return 0;
 }
 
+/*
+ * Destroy per-open state when the final reference to the file is closed.
+ */
 static int jne_demo_release(struct inode *inode, struct file *file)
 {
     struct jne_demo_file_state *state = file->private_data;
@@ -283,12 +368,27 @@ static int jne_demo_release(struct inode *inode, struct file *file)
     return 0;
 }
 
+/*
+ * Return one complete FIFO message.
+ *
+ * Empty queue:
+ *   - O_NONBLOCK: return -EAGAIN;
+ *   - blocking mode: sleep on read_wait_queue.
+ *
+ * After waking, the condition must be checked again because another reader may
+ * consume the message first. The goto therefore implements the standard
+ * "wait, lock, recheck" pattern.
+ */
 static ssize_t jne_demo_read(struct file *file, char __user *buffer, size_t count, loff_t *offset)
 {
     struct jne_demo_file_state *state = file->private_data;
     struct jne_demo_message message;
     ssize_t result;
 
+    /*
+     * cat and similar tools may call read() again on the same descriptor.
+     * Treat one message as the complete file contents for that open operation.
+     */
     if (*offset > 0) {
         return 0;
     }
@@ -314,11 +414,16 @@ wait_for_message:
         return -ERESTARTSYS;
     }
 
+    /*
+     * The atomic count is only a fast condition indicator. The FIFO itself is
+     * authoritative, so it is checked again while holding the mutex.
+     */
     if (!kfifo_peek(&message_queue, &message)) {
         mutex_unlock(&message_queue_mutex);
         goto wait_for_message;
     }
 
+    /* Preserve message boundaries: never return a truncated message. */
     if (count < message.length) {
         result = -EMSGSIZE;
         goto unlock;
@@ -329,6 +434,10 @@ wait_for_message:
         goto unlock;
     }
 
+    /*
+     * Remove the message only after copy_to_user() succeeds. On -EFAULT or
+     * -EMSGSIZE the message remains queued for a later read.
+     */
     kfifo_skip(&message_queue);
     atomic_dec(&message_count);
 
@@ -358,6 +467,13 @@ unlock:
     return result;
 }
 
+/*
+ * Copy one user-space write into the FIFO and schedule deferred processing.
+ *
+ * Full queue follows the same blocking/non-blocking policy as read(). The
+ * workqueue allocation is prepared before waiting, then either queued after a
+ * successful FIFO insertion or freed on every error path.
+ */
 static ssize_t jne_demo_write(struct file *file, const char __user *buffer, size_t count, loff_t *offset)
 {
     struct jne_demo_file_state *state = file->private_data;
@@ -371,6 +487,10 @@ static ssize_t jne_demo_write(struct file *file, const char __user *buffer, size
         return 0;
     }
 
+    /*
+     * Reserve one byte for a terminating NUL. The FIFO still tracks the exact
+     * message length, so the terminator is for diagnostics only.
+     */
     bytes_to_copy = min(count, (size_t)BUFFER_SIZE - 1);
 
     message_work = kzalloc(sizeof(*message_work), GFP_KERNEL);
@@ -409,6 +529,10 @@ wait_for_space:
         goto free_work;
     }
 
+    /*
+     * Recheck under the mutex. The queue may have changed between evaluating
+     * the wait condition and acquiring the lock.
+     */
     if (kfifo_is_full(&message_queue)) {
         mutex_unlock(&message_queue_mutex);
         goto wait_for_space;
@@ -437,6 +561,10 @@ wait_for_space:
 
     mutex_unlock(&message_queue_mutex);
 
+    /*
+     * Ownership of message_work passes to the workqueue. The callback frees it
+     * after processing.
+     */
     INIT_WORK(&message_work->work, jne_demo_process_message);
     queue_work(message_work_queue, &message_work->work);
 
@@ -448,6 +576,12 @@ free_work:
     return result;
 }
 
+/*
+ * Handle device-specific control operations defined in jne_demo_ioctl.h.
+ *
+ * CLEAR and GET_LENGTH operate on the shared FIFO. GET_STATS returns the
+ * counters belonging only to this open file descriptor.
+ */
 static long jne_demo_ioctl(struct file *file, unsigned int command, unsigned long argument)
 {
     struct jne_demo_file_state *state = file->private_data;
@@ -519,6 +653,13 @@ static long jne_demo_ioctl(struct file *file, unsigned int command, unsigned lon
     return result;
 }
 
+/*
+ * Report readiness to poll()/select()/epoll().
+ *
+ * poll_wait() registers the caller on both wait queues. The returned mask
+ * describes the state at this instant; wake_up_interruptible() later causes
+ * user space to evaluate poll() again.
+ */
 static __poll_t jne_demo_poll(struct file *file, poll_table *wait)
 {
     __poll_t mask = 0;
@@ -540,6 +681,14 @@ static __poll_t jne_demo_poll(struct file *file, poll_table *wait)
     return mask;
 }
 
+/* Workqueue callbacks. */
+
+/*
+ * Deferred processing example.
+ *
+ * This callback runs in process context on the ordered workqueue, not in the
+ * writer's system-call context. A simple checksum stands in for heavier work.
+ */
 static void jne_demo_process_message(struct work_struct *work)
 {
     struct jne_demo_work *message_work = container_of(work, struct jne_demo_work, work);
@@ -559,6 +708,12 @@ static void jne_demo_process_message(struct work_struct *work)
     kfree(message_work);
 }
 
+/*
+ * Periodic delayed-work callback.
+ *
+ * It reschedules itself until module shutdown sets module_stopping. READ_ONCE()
+ * pairs with WRITE_ONCE() to make the shutdown flag access explicit.
+ */
 static void jne_demo_status_work(struct work_struct *work)
 {
     int count;
@@ -581,6 +736,14 @@ static void jne_demo_status_work(struct work_struct *work)
     }
 }
 
+/* Resource-management helpers. */
+
+/*
+ * Create the complete debugfs interface.
+ *
+ * debugfs is diagnostic only and is not a stable user-space ABI. Any partial
+ * creation is rolled back before returning an error.
+ */
 static int jne_demo_create_debugfs(void)
 {
     struct dentry *entry;
@@ -627,12 +790,14 @@ error:
     return entry ? PTR_ERR(entry) : -ENOMEM;
 }
 
+/* Remove the directory and every file below it in one operation. */
 static void jne_demo_destroy_debugfs(void)
 {
     debugfs_remove_recursive(debugfs_directory);
     debugfs_directory = NULL;
 }
 
+/* Initialize all module-wide counters when the module is loaded. */
 static void jne_demo_reset_global_stats(void)
 {
     atomic64_set(&global_stats.opens, 0);
@@ -644,6 +809,19 @@ static void jne_demo_reset_global_stats(void)
     atomic64_set(&global_stats.async_jobs, 0);
 }
 
+/* Module lifecycle. */
+
+/*
+ * Module initialization order:
+ *
+ *   1. initialize in-memory state;
+ *   2. create the ordered workqueue;
+ *   3. register the misc device;
+ *   4. create debugfs diagnostics;
+ *   5. start periodic delayed work.
+ *
+ * Error labels release successfully created resources in reverse order.
+ */
 static int __init jne_demo_init(void)
 {
     int result;
@@ -698,6 +876,13 @@ destroy_workqueue:
     return result;
 }
 
+/*
+ * Module shutdown.
+ *
+ * New user-space entry points are removed first. Delayed work is then stopped
+ * synchronously, and destroy_workqueue() waits for already queued message jobs
+ * before releasing the workqueue.
+ */
 static void __exit jne_demo_exit(void)
 {
     jne_demo_destroy_debugfs();

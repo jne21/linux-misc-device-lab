@@ -1,0 +1,81 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build kernel module
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            linux-headers-generic
+
+      - name: Find kernel headers
+        id: headers
+        shell: bash
+        run: |
+          KDIR="$(find /usr/src \
+            -maxdepth 1 \
+            -type d \
+            -name 'linux-headers-*-generic' \
+            | sort -V \
+            | tail -n 1)"
+
+          if [[ -z "$KDIR" ]]; then
+            echo "Kernel headers were not found" >&2
+            exit 1
+          fi
+
+          echo "kdir=$KDIR" >> "$GITHUB_OUTPUT"
+          echo "Using kernel headers: $KDIR"
+
+      - name: Build module and user-space tests
+        run: make KDIR="${{ steps.headers.outputs.kdir }}"
+
+      - name: Verify build output
+        shell: bash
+        run: |
+          files=(
+            bin/jne_demo.ko
+            bin/nonblock_read
+            bin/nonblock_write
+            bin/poll_read
+            bin/ioctl_test
+            bin/file_state_test
+          )
+
+          for file in "${files[@]}"; do
+            if [[ ! -f "$file" ]]; then
+              echo "Missing build output: $file" >&2
+              exit 1
+            fi
+          done
+
+          test -x bin/nonblock_read
+          test -x bin/nonblock_write
+          test -x bin/poll_read
+          test -x bin/ioctl_test
+          test -x bin/file_state_test
+
+      - name: Show build output
+        run: |
+          ls -lah bin
+          file bin/jne_demo.ko

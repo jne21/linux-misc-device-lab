@@ -1,6 +1,6 @@
 MODULE_NAME := jne_demo
 
-KDIR := /lib/modules/$(shell uname -r)/build
+KDIR ?= /lib/modules/$(shell uname -r)/build
 PROJECT_DIR := $(CURDIR)
 BIN_DIR := $(PROJECT_DIR)/bin
 TESTS_DIR := $(PROJECT_DIR)/tests

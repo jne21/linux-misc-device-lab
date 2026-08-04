@@ -5,38 +5,39 @@
 ![Kernel Module](https://img.shields.io/badge/type-kernel%20module-orange)
 ![Status](https://img.shields.io/badge/status-learning%20project-green)
 
-An demonstrational Linux kernel module that implements a message-oriented miscellaneous character device:
+An demonstration Linux kernel module that implements a message-oriented miscellaneous character device:
 
 ```text
 /dev/jne_demo
 ```
 
-The project demonstrates communication between user space and kernel space through standard Linux file operations, blocking and non-blocking I/O, wait queues, polling, synchronization, `ioctl()` commands, typed kernel FIFO storage, per-open state, and asynchronous workqueue processing.
+The project demonstrates communication between user space and kernel space through standard Linux file operations, blocking and non-blocking I/O, wait queues, polling, synchronization, `ioctl()` commands, typed kernel FIFO storage, per-open state, asynchronous workqueue processing, and periodic delayed work.
 
 ## Features
 
-| Feature                 | Implementation                  |
-| ----------------------- | ------------------------------- |
-| Character device        | Linux `miscdevice` API          |
-| Device path             | `/dev/jne_demo`                 |
-| Message storage         | Typed `kfifo`                   |
-| Queue capacity          | 16 messages                     |
-| Maximum message size    | 255 bytes                       |
-| Reading                 | `read()` callback               |
-| Writing                 | `write()` callback              |
-| User-to-kernel transfer | `copy_from_user()`              |
-| Kernel-to-user transfer | `copy_to_user()`                |
-| Queue synchronization   | Kernel `mutex`                  |
-| Queue state             | `atomic_t` message counter      |
-| Blocking reads          | Reader wait queue               |
-| Blocking writes         | Writer wait queue               |
-| Non-blocking I/O        | `O_NONBLOCK` and `-EAGAIN`      |
-| Readiness notification  | `poll()`, `select()`, `epoll()` |
-| Control commands        | `ioctl()`                       |
-| Per-open statistics     | `file->private_data`            |
-| Asynchronous processing | Ordered kernel workqueue        |
-| Diagnostics             | `pr_info()` and `dmesg`         |
-| Build output            | `bin/` directory                |
+| Feature                   | Implementation                  |
+| ------------------------- | ------------------------------- |
+| Character device          | Linux `miscdevice` API          |
+| Device path               | `/dev/jne_demo`                 |
+| Message storage           | Typed `kfifo`                   |
+| Queue capacity            | 16 messages                     |
+| Maximum message size      | 255 bytes                       |
+| Reading                   | `read()` callback               |
+| Writing                   | `write()` callback              |
+| User-to-kernel transfer   | `copy_from_user()`              |
+| Kernel-to-user transfer   | `copy_to_user()`                |
+| Queue synchronization     | Kernel `mutex`                  |
+| Queue state               | `atomic_t` message counter      |
+| Blocking reads            | Reader wait queue               |
+| Blocking writes           | Writer wait queue               |
+| Non-blocking I/O          | `O_NONBLOCK` and `-EAGAIN`      |
+| Readiness notification    | `poll()`, `select()`, `epoll()` |
+| Control commands          | `ioctl()`                       |
+| Per-open statistics       | `file->private_data`            |
+| Asynchronous processing   | Ordered kernel workqueue        |
+| Periodic status reporting | `delayed_work` every 5 seconds  |
+| Diagnostics               | `pr_info()` and `dmesg`         |
+| Build output              | `bin/` directory                |
 
 ## Architecture
 
@@ -69,15 +70,16 @@ The project demonstrates communication between user space and kernel space throu
 │  writer wait queue                            │
 │  per-open file state                          │
 │  ordered workqueue                            │
+│  periodic delayed work                        │
 └──────────────────────┬────────────────────────┘
                        │
                asynchronous work
                        │
 ┌──────────────────────▼────────────────────────┐
-│             jne_demo_wq worker                │
+│             jne_demo_wq workers               │
 │                                               │
-│  message checksum calculation                 │
-│  diagnostic logging                           │
+│  asynchronous checksum processing             │
+│  periodic FIFO status reporting               │
 └───────────────────────────────────────────────┘
 ```
 
@@ -138,21 +140,14 @@ struct jne_demo_work {
 The workqueue is created during module initialization:
 
 ```c
-message_work_queue = alloc_ordered_workqueue(
-    "jne_demo_wq",
-    0);
+message_work_queue = alloc_ordered_workqueue("jne_demo_wq", 0);
 ```
 
 The writer schedules asynchronous processing without waiting for it to finish:
 
 ```c
-INIT_WORK(
-    &message_work->work,
-    jne_demo_process_message);
-
-queue_work(
-    message_work_queue,
-    &message_work->work);
+INIT_WORK(&message_work->work, jne_demo_process_message);
+queue_work(message_work_queue, &message_work->work);
 ```
 
 The worker calculates a simple checksum:
@@ -160,20 +155,16 @@ The worker calculates a simple checksum:
 ```c
 static void jne_demo_process_message(struct work_struct *work)
 {
-    struct jne_demo_work *message_work;
-    unsigned int checksum = 0;
-    size_t index;
-
-    message_work = container_of(
+    struct jne_demo_work *message_work = container_of(
         work,
         struct jne_demo_work,
         work);
 
-    for (index = 0;
-         index < message_work->message.length;
-         index++)
-        checksum +=
-            (unsigned char)message_work->message.data[index];
+    unsigned int checksum = 0;
+    size_t index;
+
+    for (index = 0; index < message_work->message.length; index++)
+        checksum += (unsigned char)message_work->message.data[index];
 
     pr_info(
         "jne_demo: asynchronously processed %zu bytes, checksum=%u\n",
@@ -187,6 +178,118 @@ static void jne_demo_process_message(struct work_struct *work)
 An ordered workqueue executes submitted work items sequentially and preserves their order.
 
 The original message remains in the FIFO and can still be read through `/dev/jne_demo`.
+
+## Periodic Delayed Work
+
+The module periodically reports the current FIFO state through a delayed work item.
+
+The reporting interval is configured as:
+
+```c
+#define STATUS_INTERVAL_MS 5000
+```
+
+A static delayed work object is used:
+
+```c
+static struct delayed_work status_work;
+```
+
+The callback reports the number of occupied and available queue positions:
+
+```c
+static void jne_demo_status_work(struct work_struct *work)
+{
+    int count;
+
+    (void)work;
+
+    count = atomic_read(&message_count);
+
+    pr_info(
+        "jne_demo: queue status: %d/%d messages, %d slots available\n",
+        count,
+        QUEUE_CAPACITY,
+        QUEUE_CAPACITY - count);
+
+    if (!READ_ONCE(module_stopping))
+        queue_delayed_work(
+            message_work_queue,
+            &status_work,
+            msecs_to_jiffies(STATUS_INTERVAL_MS));
+}
+```
+
+The delayed work is initialized during module startup:
+
+```c
+INIT_DELAYED_WORK(&status_work, jne_demo_status_work);
+```
+
+The first execution is scheduled after the device has been registered:
+
+```c
+queue_delayed_work(
+    message_work_queue,
+    &status_work,
+    msecs_to_jiffies(STATUS_INTERVAL_MS));
+```
+
+Each callback schedules the next execution, creating periodic status reporting without a busy loop.
+
+The interval is converted from milliseconds to kernel ticks with:
+
+```c
+msecs_to_jiffies(STATUS_INTERVAL_MS)
+```
+
+Example kernel log output:
+
+```text
+jne_demo: queue status: 0/16 messages, 16 slots available
+jne_demo: queue status: 3/16 messages, 13 slots available
+jne_demo: queue status: 2/16 messages, 14 slots available
+```
+
+### Safe Cancellation
+
+The module uses a stopping flag to prevent the callback from scheduling another execution while the module is being unloaded:
+
+```c
+static bool module_stopping;
+```
+
+The flag is reset during module initialization:
+
+```c
+WRITE_ONCE(module_stopping, false);
+```
+
+Before unloading, the module sets it to `true`:
+
+```c
+WRITE_ONCE(module_stopping, true);
+```
+
+The callback checks the flag before scheduling itself again:
+
+```c
+if (!READ_ONCE(module_stopping))
+    queue_delayed_work(
+        message_work_queue,
+        &status_work,
+        msecs_to_jiffies(STATUS_INTERVAL_MS));
+```
+
+The delayed work is cancelled synchronously before the workqueue is destroyed:
+
+```c
+WRITE_ONCE(module_stopping, true);
+cancel_delayed_work_sync(&status_work);
+destroy_workqueue(message_work_queue);
+```
+
+`cancel_delayed_work_sync()` cancels a pending delayed execution and waits for a currently running callback to finish.
 
 ## Per-Open State
 
@@ -281,7 +384,7 @@ Build the kernel module and user-space test programs:
 make
 ```
 
-Generated files are placed in:
+Generated binaries are placed in:
 
 ```text
 bin/
@@ -293,7 +396,7 @@ The kernel module is created as:
 bin/jne_demo.ko
 ```
 
-Remove all generated files:
+Remove generated files:
 
 ```bash
 make clean
@@ -356,6 +459,7 @@ jne_demo: module loaded
 jne_demo: device opened
 jne_demo: queued 12 bytes, 1 messages available
 jne_demo: asynchronously processed 12 bytes, checksum=...
+jne_demo: queue status: 1/16 messages, 15 slots available
 jne_demo: read 12 bytes, 0 messages remain
 jne_demo: device closed, read=1 messages/12 bytes, written=1 messages/12 bytes
 jne_demo: module unloaded
@@ -508,15 +612,20 @@ Read 26 bytes: Non-blocking read message
 The test opens the device with:
 
 ```c
-fd = open(
-    "/dev/jne_demo",
-    O_RDONLY | O_NONBLOCK);
+fd = open("/dev/jne_demo", O_RDONLY | O_NONBLOCK);
 ```
 
 When the queue is empty, the driver returns:
 
 ```c
 return -EAGAIN;
+```
+
+In user space:
+
+```c
+read(...) == -1;
+errno == EAGAIN;
 ```
 
 ## Non-Blocking Write
@@ -548,9 +657,7 @@ Queue is full
 The test opens the device with:
 
 ```c
-fd = open(
-    "/dev/jne_demo",
-    O_WRONLY | O_NONBLOCK);
+fd = open("/dev/jne_demo", O_WRONLY | O_NONBLOCK);
 ```
 
 When the queue is full, the driver returns:
@@ -570,9 +677,7 @@ The driver supports readiness notification through:
 The callback registers both wait queues:
 
 ```c
-static __poll_t jne_demo_poll(
-    struct file *file,
-    poll_table *wait)
+static __poll_t jne_demo_poll(struct file *file, poll_table *wait)
 {
     __poll_t mask = 0;
     int count;
@@ -639,16 +744,10 @@ The shared header defines the control interface:
     _IO(JNE_DEMO_IOC_MAGIC, 1)
 
 #define JNE_DEMO_IOC_GET_LENGTH \
-    _IOR(
-        JNE_DEMO_IOC_MAGIC,
-        2,
-        unsigned int)
+    _IOR(JNE_DEMO_IOC_MAGIC, 2, unsigned int)
 
 #define JNE_DEMO_IOC_GET_STATS \
-    _IOR(
-        JNE_DEMO_IOC_MAGIC,
-        3,
-        struct jne_demo_stats)
+    _IOR(JNE_DEMO_IOC_MAGIC, 3, struct jne_demo_stats)
 ```
 
 Available commands:
@@ -738,13 +837,13 @@ The FIFO is protected by a kernel mutex:
 static DEFINE_MUTEX(message_queue_mutex);
 ```
 
-The current number of queued messages is also tracked through:
+The current number of queued messages is tracked through:
 
 ```c
 static atomic_t message_count = ATOMIC_INIT(0);
 ```
 
-The mutex protects compound FIFO operations. The atomic counter provides a lightweight condition for wait queues and `poll()`.
+The mutex protects compound FIFO operations. The atomic counter provides a lightweight condition for wait queues, `poll()`, and periodic status reporting.
 
 The code rechecks FIFO state after acquiring the mutex because another reader or writer may have changed the queue between the initial state check and lock acquisition.
 
@@ -779,15 +878,47 @@ static struct miscdevice jne_demo_device = {
 
 ## Safe Module Unloading
 
-During module removal:
+The device is deregistered first so that no new file descriptors can be opened:
+
+```c
+misc_deregister(&jne_demo_device);
+```
+
+The periodic callback is prevented from scheduling itself again:
+
+```c
+WRITE_ONCE(module_stopping, true);
+```
+
+Pending or running delayed work is cancelled synchronously:
+
+```c
+cancel_delayed_work_sync(&status_work);
+```
+
+The ordered workqueue is then destroyed:
 
 ```c
 destroy_workqueue(message_work_queue);
+message_work_queue = NULL;
 ```
 
-waits for queued work items to finish before the workqueue is destroyed.
+The complete sequence is:
 
-This prevents worker callbacks from executing after the module code has been unloaded.
+```c
+static void __exit jne_demo_exit(void)
+{
+    misc_deregister(&jne_demo_device);
+
+    WRITE_ONCE(module_stopping, true);
+    cancel_delayed_work_sync(&status_work);
+
+    destroy_workqueue(message_work_queue);
+    message_work_queue = NULL;
+
+    pr_info("jne_demo: module unloaded\n");
+}
+```
 
 Unload the module:
 
@@ -854,9 +985,9 @@ Recommended precautions:
 * [x] Per-open statistics
 * [x] Ordered workqueue
 * [x] Asynchronous message processing
+* [x] Periodic delayed work
+* [x] Safe delayed-work cancellation
 * [x] Separate `bin/` build output
-* [ ] Kernel timer
-* [ ] Delayed work
 * [ ] Automated integration tests
 * [ ] CI build verification
 * [ ] Device Tree and platform-driver example
@@ -889,8 +1020,14 @@ per-open file state
 ordered workqueue
     ↓
 asynchronous kernel processing
+    ↓
+delayed work
+    ↓
+periodic kernel tasks
+    ↓
+safe asynchronous cancellation
 ```
 
 ## License
 
-This project is intended for educational and demonstration purposes.
+This project is intended for demonstration purposes.
